@@ -4,3 +4,5 @@ playwright
 pydantic
 python-dotenv
 google-genai
+requests
+pytest
