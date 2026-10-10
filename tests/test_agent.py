@@ -118,3 +118,29 @@ def test_agent_retries_temporary_tool_failure():
     assert agent.executor.execute_tool.call_count == 2
     assert state.data["retry_count"] == 1
     assert len(state.errors) == 1
+
+def test_recovered_error_does_not_block_verification():
+    from agent.recovery import Recovery
+    from agent.state import AgentState
+    from agent.verifier import Verifier
+
+    state = AgentState(user_goal="Test error recovery")
+    recovery = Recovery()
+
+    recovery.handle_error(state, "Temporary connection error")
+    assert state.data["unresolved_errors"] == [
+        "Temporary connection error"
+    ]
+
+    recovery.mark_recovered(
+        state,
+        "Temporary connection error",
+    )
+
+    state.data["verification_passed"] = True
+
+    assert state.data["unresolved_errors"] == []
+    assert state.errors == ["Temporary connection error"]
+    assert Verifier().verify(state) is True
+    assert state.success is True
+    assert state.finished is True

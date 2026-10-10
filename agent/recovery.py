@@ -18,6 +18,10 @@ class Recovery:
 
         state.errors.append(error)
 
+        # Keep track of errors that have not yet been recovered.
+        unresolved = state.data.setdefault("unresolved_errors", [])
+        unresolved.append(error)
+
         attempts = state.data.get("retry_count", 0) + 1
         state.data["retry_count"] = attempts
 
@@ -26,3 +30,12 @@ class Recovery:
             return False
 
         return True
+
+    def mark_recovered(self, state: AgentState, error: str) -> None:
+        """Remove a recovered error from the unresolved error list."""
+
+        unresolved = state.data.setdefault("unresolved_errors", [])
+
+        if error in unresolved:
+            unresolved.remove(error)
+

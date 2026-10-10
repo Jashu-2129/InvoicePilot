@@ -1,3 +1,4 @@
+
 import json
 
 from agent.state import AgentState
@@ -30,6 +31,10 @@ class InvoiceAgent:
     ) -> dict:
         """Retry a tool call after unexpected temporary failures."""
 
+        # Reset the retry counter for this tool call.
+        state.data["retry_count"] = 0
+        errors_this_call = []
+
         while True:
             try:
                 logger.info(
@@ -44,6 +49,17 @@ class InvoiceAgent:
                     **arguments,
                 )
 
+                # The tool succeeded, so resolve its previous retry errors.
+                for error in errors_this_call:
+                    self.recovery.mark_recovered(state, error)
+
+                if errors_this_call:
+                    logger.info(
+                        "Tool '%s' recovered after %s failed attempt(s)",
+                        tool_name,
+                        len(errors_this_call),
+                    )
+
                 logger.info(
                     "Tool '%s' executed successfully",
                     tool_name,
@@ -56,15 +72,18 @@ class InvoiceAgent:
                 raise
 
             except Exception as exc:
+                error = str(exc)
+                errors_this_call.append(error)
+
                 should_retry = self.recovery.handle_error(
                     state,
-                    str(exc),
+                    error,
                 )
 
                 logger.warning(
                     "Tool '%s' failed: %s",
                     tool_name,
-                    exc,
+                    error,
                 )
 
                 if not should_retry:
@@ -74,14 +93,11 @@ class InvoiceAgent:
                     )
                     raise
 
-                logger.info(
-                    "Retrying tool '%s'",
-                    tool_name,
-                )
+                logger.info("Retrying tool '%s'", tool_name)
 
                 self.observer.observe(
                     state,
-                    f"Temporary tool error; retrying: {exc}",
+                    f"Temporary tool error; retrying: {error}",
                 )
 
     def run(self, user_goal: str) -> AgentState:
@@ -319,7 +335,10 @@ class InvoiceAgent:
         except ValueError as exc:
             self.recovery.handle_error(state, str(exc))
 
-            logger.error("Agent stopped due to a known error: %s", exc)
+            logger.error(
+                "Agent stopped due to a known error: %s",
+                exc,
+            )
 
             self.observer.observe(
                 state,

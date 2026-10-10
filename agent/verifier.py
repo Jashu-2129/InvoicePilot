@@ -1,3 +1,4 @@
+
 from agent.state import AgentState
 
 
@@ -14,8 +15,8 @@ class Verifier:
             state.success = False
             return False
 
-        # Do not report success if the agent recorded an error.
-        if state.errors:
+        # Do not succeed if any error remains unresolved.
+        if state.data.get("unresolved_errors", []):
             state.success = False
             return False
 
