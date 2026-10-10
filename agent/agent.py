@@ -1,3 +1,4 @@
+
 import json
 
 from agent.state import AgentState
@@ -19,7 +20,7 @@ class InvoiceAgent:
         self.verifier = Verifier()
 
     def run(self, user_goal: str) -> AgentState:
-        """Plan, inspect an invoice, and report its amount."""
+        """Plan and execute supported invoice-processing tasks."""
 
         state = AgentState(user_goal=user_goal)
 
@@ -27,15 +28,68 @@ class InvoiceAgent:
             # Step 1: Generate the plan.
             self.planner.create_plan(state)
 
-            # Step 2: Execute the supported steps.
+            # Step 2: Execute the supported plan steps.
             for step in state.plan:
                 if state.finished:
                     break
 
                 step_lower = step.lower()
 
+                # Check invoice approval eligibility.
+                if "check approval eligibility" in step_lower:
+                    words = step.replace(",", " ").split()
+
+                    invoice_id = next(
+                        (
+                            word.strip(".,:;")
+                            for word in words
+                            if word.upper().startswith("INV-")
+                        ),
+                        None,
+                    )
+
+                    if invoice_id is None:
+                        self.observer.observe(
+                            state,
+                            f"Could not find an invoice ID in: {step}",
+                        )
+                        continue
+
+                    result = self.executor.execute_tool(
+                        state,
+                        "check_approval_eligibility",
+                        invoice_id=invoice_id,
+                    )
+
+                    state.data["approval_eligibility"] = result
+
+                    amount = result["amount"]
+                    status = result["status"]
+
+                    if result["human_approval_required"]:
+                        approval_message = (
+                            f"Invoice {invoice_id} is ₹{amount:,.2f}. "
+                            "Human approval is required."
+                        )
+                    else:
+                        approval_message = (
+                            f"Invoice {invoice_id} is ₹{amount:,.2f}. "
+                            "Human approval is not required by the threshold."
+                        )
+
+                    if not result["eligible_for_approval_review"]:
+                        approval_message += (
+                            f" Current status is '{status}'; "
+                            "it is not eligible for approval review."
+                        )
+
+                    self.observer.observe(state, approval_message)
+
                 # Find and inspect an invoice.
-                if "inspect" in step_lower or "find invoice" in step_lower:
+                elif (
+                    "inspect" in step_lower
+                    or "find invoice" in step_lower
+                ):
                     words = step.replace(",", " ").split()
 
                     invoice_id = next(
@@ -76,7 +130,10 @@ class InvoiceAgent:
                     )
 
                 # Read the amount from the retrieved invoice.
-                elif "read invoice amount" in step_lower:
+                elif (
+                    "read invoice amount" in step_lower
+                    or "read the invoice amount" in step_lower
+                ):
                     invoice = state.data.get("invoice")
 
                     if invoice is None:
@@ -88,7 +145,11 @@ class InvoiceAgent:
 
                     amount = invoice.get("amount")
 
-                    if not isinstance(amount, (int, float)):
+                    if (
+                        not isinstance(amount, (int, float))
+                        or isinstance(amount, bool)
+                        or amount < 0
+                    ):
                         self.observer.observe(
                             state,
                             "Invoice amount is missing or invalid.",
@@ -103,7 +164,10 @@ class InvoiceAgent:
                     )
 
                 # Report the amount.
-                elif "report invoice amount" in step_lower:
+                elif (
+                    "report invoice amount" in step_lower
+                    or "report the amount" in step_lower
+                ):
                     amount = state.data.get("invoice_amount")
 
                     if amount is None:
@@ -124,19 +188,31 @@ class InvoiceAgent:
                         f"Skipped unsupported plan step: {step}",
                     )
 
-            # Step 3: Verify that all required stages were completed.
+            # Step 3: Verify the requested workflow.
             observations = "\n".join(state.observations)
 
-            state.data["verification_passed"] = (
+            amount_reported = (
                 state.data.get("invoice") is not None
                 and state.data.get("invoice_amount") is not None
                 and "Report: The invoice amount is" in observations
             )
 
+            approval_checked = (
+                state.data.get("approval_eligibility") is not None
+                and any(
+                    "Human approval" in observation
+                    for observation in state.observations
+                )
+            )
+
+            state.data["verification_passed"] = (
+                amount_reported or approval_checked
+            )
+
             self.verifier.verify(state)
 
         except ValueError as exc:
-            # Handle known errors, such as an invoice not being found.
+            # Handle known errors, such as a missing invoice.
             self.recovery.handle_error(state, str(exc))
             self.observer.observe(state, f"Error: {exc}")
 
@@ -157,5 +233,3 @@ class InvoiceAgent:
             self.verifier.verify(state)
 
         return state
-
-
