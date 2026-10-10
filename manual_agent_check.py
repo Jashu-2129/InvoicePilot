@@ -1,4 +1,3 @@
-
 from agent.agent import InvoiceAgent
 
 
@@ -6,17 +5,13 @@ class FakeLLM:
     """Simulates an LLM without using API credits."""
 
     def ask(self, prompt: str) -> str:
-        return (
-            '["Find invoice INV-001", '
-            '"Read invoice amount", '
-            '"Report invoice amount"]'
-        )
+        return '["Find invoice INV-999"]'
 
 
 agent = InvoiceAgent(FakeLLM())
 
 state = agent.run(
-    "Find invoice INV-001 and report its amount"
+    "Find invoice INV-999"
 )
 
 print("Goal:", state.user_goal)

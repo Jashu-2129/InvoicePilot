@@ -1,4 +1,3 @@
-
 import json
 
 from agent.state import AgentState
@@ -19,6 +18,40 @@ class InvoiceAgent:
         self.recovery = Recovery()
         self.verifier = Verifier()
 
+    def execute_with_retry(
+        self,
+        state: AgentState,
+        tool_name: str,
+        **arguments,
+    ) -> dict:
+        """Retry a tool call after unexpected temporary failures."""
+
+        while True:
+            try:
+                return self.executor.execute_tool(
+                    state,
+                    tool_name,
+                    **arguments,
+                )
+
+            except ValueError:
+                # Missing invoices and invalid inputs are not retryable.
+                raise
+
+            except Exception as exc:
+                should_retry = self.recovery.handle_error(
+                    state,
+                    str(exc),
+                )
+
+                if not should_retry:
+                    raise
+
+                self.observer.observe(
+                    state,
+                    f"Temporary tool error; retrying: {exc}",
+                )
+
     def run(self, user_goal: str) -> AgentState:
         """Plan and execute supported invoice-processing tasks."""
 
@@ -28,7 +61,7 @@ class InvoiceAgent:
             # Step 1: Generate the plan.
             self.planner.create_plan(state)
 
-            # Step 2: Execute the supported plan steps.
+            # Step 2: Execute supported plan steps.
             for step in state.plan:
                 if state.finished:
                     break
@@ -55,7 +88,7 @@ class InvoiceAgent:
                         )
                         continue
 
-                    result = self.executor.execute_tool(
+                    result = self.execute_with_retry(
                         state,
                         "check_approval_eligibility",
                         invoice_id=invoice_id,
@@ -68,13 +101,16 @@ class InvoiceAgent:
 
                     if result["human_approval_required"]:
                         approval_message = (
-                            f"Invoice {invoice_id} is ₹{amount:,.2f}. "
+                            f"Invoice {invoice_id} is "
+                            f"\u20b9{amount:,.2f}. "
                             "Human approval is required."
                         )
                     else:
                         approval_message = (
-                            f"Invoice {invoice_id} is ₹{amount:,.2f}. "
-                            "Human approval is not required by the threshold."
+                            f"Invoice {invoice_id} is "
+                            f"\u20b9{amount:,.2f}. "
+                            "Human approval is not required "
+                            "by the threshold."
                         )
 
                     if not result["eligible_for_approval_review"]:
@@ -108,7 +144,7 @@ class InvoiceAgent:
                         )
                         continue
 
-                    result = self.executor.execute_tool(
+                    result = self.execute_with_retry(
                         state,
                         "inspect_invoice",
                         invoice_id=invoice_id,
@@ -122,7 +158,6 @@ class InvoiceAgent:
                     invoice = json.loads(result["page_content"])
 
                     state.data["invoice"] = invoice
-                    state.data["verification_passed"] = False
 
                     self.observer.observe(
                         state,
@@ -160,7 +195,7 @@ class InvoiceAgent:
 
                     self.observer.observe(
                         state,
-                        f"Invoice amount: ₹{amount:,.2f}",
+                        f"Invoice amount: \u20b9{amount:,.2f}",
                     )
 
                 # Report the amount.
@@ -179,7 +214,8 @@ class InvoiceAgent:
 
                     self.observer.observe(
                         state,
-                        f"Report: The invoice amount is ₹{amount:,.2f}.",
+                        f"Report: The invoice amount is "
+                        f"\u20b9{amount:,.2f}.",
                     )
 
                 else:
@@ -212,7 +248,7 @@ class InvoiceAgent:
             self.verifier.verify(state)
 
         except ValueError as exc:
-            # Handle known errors, such as a missing invoice.
+            # Known errors, such as a missing invoice.
             self.recovery.handle_error(state, str(exc))
             self.observer.observe(state, f"Error: {exc}")
 
@@ -221,8 +257,7 @@ class InvoiceAgent:
             self.verifier.verify(state)
 
         except Exception as exc:
-            # Handle unexpected errors.
-            self.recovery.handle_error(state, str(exc))
+            # Unexpected errors after retries are exhausted.
             self.observer.observe(
                 state,
                 f"Unexpected error: {exc}",
