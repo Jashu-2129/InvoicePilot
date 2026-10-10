@@ -6,6 +6,10 @@ from agent.executor import Executor
 from agent.observer import Observer
 from agent.recovery import Recovery
 from agent.verifier import Verifier
+from utils.logger import get_logger
+
+
+logger = get_logger(__name__)
 
 
 class InvoiceAgent:
@@ -28,11 +32,24 @@ class InvoiceAgent:
 
         while True:
             try:
-                return self.executor.execute_tool(
+                logger.info(
+                    "Executing tool '%s' with arguments %s",
+                    tool_name,
+                    arguments,
+                )
+
+                result = self.executor.execute_tool(
                     state,
                     tool_name,
                     **arguments,
                 )
+
+                logger.info(
+                    "Tool '%s' executed successfully",
+                    tool_name,
+                )
+
+                return result
 
             except ValueError:
                 # Missing invoices and invalid inputs are not retryable.
@@ -44,8 +61,23 @@ class InvoiceAgent:
                     str(exc),
                 )
 
+                logger.warning(
+                    "Tool '%s' failed: %s",
+                    tool_name,
+                    exc,
+                )
+
                 if not should_retry:
+                    logger.error(
+                        "Retry limit reached for tool '%s'",
+                        tool_name,
+                    )
                     raise
+
+                logger.info(
+                    "Retrying tool '%s'",
+                    tool_name,
+                )
 
                 self.observer.observe(
                     state,
@@ -57,15 +89,24 @@ class InvoiceAgent:
 
         state = AgentState(user_goal=user_goal)
 
+        logger.info("Starting agent for goal: %s", user_goal)
+
         try:
             # Step 1: Generate the plan.
+            logger.info("Generating execution plan")
             self.planner.create_plan(state)
+
+            logger.info(
+                "Plan generated with %s steps",
+                len(state.plan),
+            )
 
             # Step 2: Execute supported plan steps.
             for step in state.plan:
                 if state.finished:
                     break
 
+                logger.info("Processing plan step: %s", step)
                 step_lower = step.lower()
 
                 # Check invoice approval eligibility.
@@ -82,10 +123,11 @@ class InvoiceAgent:
                     )
 
                     if invoice_id is None:
-                        self.observer.observe(
-                            state,
-                            f"Could not find an invoice ID in: {step}",
+                        message = (
+                            f"Could not find an invoice ID in: {step}"
                         )
+                        logger.warning(message)
+                        self.observer.observe(state, message)
                         continue
 
                     result = self.execute_with_retry(
@@ -119,7 +161,15 @@ class InvoiceAgent:
                             "it is not eligible for approval review."
                         )
 
-                    self.observer.observe(state, approval_message)
+                    self.observer.observe(
+                        state,
+                        approval_message,
+                    )
+
+                    logger.info(
+                        "Checked approval eligibility for %s",
+                        invoice_id,
+                    )
 
                 # Find and inspect an invoice.
                 elif (
@@ -138,10 +188,11 @@ class InvoiceAgent:
                     )
 
                     if invoice_id is None:
-                        self.observer.observe(
-                            state,
-                            f"Could not find an invoice ID in: {step}",
+                        message = (
+                            f"Could not find an invoice ID in: {step}"
                         )
+                        logger.warning(message)
+                        self.observer.observe(state, message)
                         continue
 
                     result = self.execute_with_retry(
@@ -156,12 +207,16 @@ class InvoiceAgent:
                         )
 
                     invoice = json.loads(result["page_content"])
-
                     state.data["invoice"] = invoice
 
                     self.observer.observe(
                         state,
                         f"Retrieved invoice {invoice_id}.",
+                    )
+
+                    logger.info(
+                        "Retrieved invoice %s",
+                        invoice_id,
                     )
 
                 # Read the amount from the retrieved invoice.
@@ -172,10 +227,12 @@ class InvoiceAgent:
                     invoice = state.data.get("invoice")
 
                     if invoice is None:
-                        self.observer.observe(
-                            state,
-                            "Cannot read amount: invoice has not been retrieved.",
+                        message = (
+                            "Cannot read amount: "
+                            "invoice has not been retrieved."
                         )
+                        logger.warning(message)
+                        self.observer.observe(state, message)
                         continue
 
                     amount = invoice.get("amount")
@@ -185,10 +242,11 @@ class InvoiceAgent:
                         or isinstance(amount, bool)
                         or amount < 0
                     ):
-                        self.observer.observe(
-                            state,
-                            "Invoice amount is missing or invalid.",
+                        message = (
+                            "Invoice amount is missing or invalid."
                         )
+                        logger.warning(message)
+                        self.observer.observe(state, message)
                         continue
 
                     state.data["invoice_amount"] = amount
@@ -198,6 +256,8 @@ class InvoiceAgent:
                         f"Invoice amount: \u20b9{amount:,.2f}",
                     )
 
+                    logger.info("Invoice amount read successfully")
+
                 # Report the amount.
                 elif (
                     "report invoice amount" in step_lower
@@ -206,10 +266,12 @@ class InvoiceAgent:
                     amount = state.data.get("invoice_amount")
 
                     if amount is None:
-                        self.observer.observe(
-                            state,
-                            "Cannot report amount: amount has not been read.",
+                        message = (
+                            "Cannot report amount: "
+                            "amount has not been read."
                         )
+                        logger.warning(message)
+                        self.observer.observe(state, message)
                         continue
 
                     self.observer.observe(
@@ -218,11 +280,12 @@ class InvoiceAgent:
                         f"\u20b9{amount:,.2f}.",
                     )
 
+                    logger.info("Invoice amount reported successfully")
+
                 else:
-                    self.observer.observe(
-                        state,
-                        f"Skipped unsupported plan step: {step}",
-                    )
+                    message = f"Skipped unsupported plan step: {step}"
+                    logger.warning(message)
+                    self.observer.observe(state, message)
 
             # Step 3: Verify the requested workflow.
             observations = "\n".join(state.observations)
@@ -247,17 +310,31 @@ class InvoiceAgent:
 
             self.verifier.verify(state)
 
+            logger.info(
+                "Agent completed. Success=%s, Finished=%s",
+                state.success,
+                state.finished,
+            )
+
         except ValueError as exc:
-            # Known errors, such as a missing invoice.
             self.recovery.handle_error(state, str(exc))
-            self.observer.observe(state, f"Error: {exc}")
+
+            logger.error("Agent stopped due to a known error: %s", exc)
+
+            self.observer.observe(
+                state,
+                f"Error: {exc}",
+            )
 
             state.data["verification_passed"] = False
             state.finished = True
             self.verifier.verify(state)
 
         except Exception as exc:
-            # Unexpected errors after retries are exhausted.
+            logger.exception(
+                "Unexpected error while running the agent"
+            )
+
             self.observer.observe(
                 state,
                 f"Unexpected error: {exc}",
@@ -267,4 +344,5 @@ class InvoiceAgent:
             state.finished = True
             self.verifier.verify(state)
 
+        # Always return the state, including when an error occurs.
         return state
