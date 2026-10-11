@@ -79,7 +79,7 @@ User goal: {state.user_goal}
                 elif compact == "readinvoiceamount":
                     normalized_plan.append("Read invoice amount")
 
-                elif compact.replace(" ", "") == "reportinvoiceamount":
+                elif compact == "reportinvoiceamount":
                     normalized_plan.append("Report invoice amount")
 
                 else:
