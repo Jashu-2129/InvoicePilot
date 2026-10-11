@@ -5,3 +5,13 @@ __pycache__/
 .pytest_cache/
 finance_app/invoices.db
 logs/
+# Python test and tooling caches
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Local environment and editor files
+.env.*
+!.env.example
+.vscode/
