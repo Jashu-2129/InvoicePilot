@@ -28,4 +28,12 @@ class LLMClient:
             contents=prompt,
         )
 
-        return response.text
+        text = response.text
+
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError(
+                "Gemini returned an empty text response."
+                "Try again or check the model response."
+            )
+
+        return text.strip()
