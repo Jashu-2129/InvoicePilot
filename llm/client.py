@@ -1,6 +1,5 @@
 import os
 from dotenv import load_dotenv
-from google import genai
 
 load_dotenv()
 
@@ -17,6 +16,14 @@ class LLMClient:
                 "GEMINI_API_KEY is not set. "
                 "Please add it to your .env file."
             )
+
+        try:
+            from google import genai
+        except ImportError as exc:
+            raise ImportError(
+                "The Google Gemini SDK is missing. Install project dependencies "
+                "with: python -m pip install -r requirements.txt"
+            ) from exc
 
         self.client = genai.Client(api_key=self.api_key)
 

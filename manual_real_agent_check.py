@@ -5,8 +5,8 @@ from agent.agent import InvoiceAgent
 agent = InvoiceAgent(LLMClient())
 
 state = agent.run(
-    "Find invoice INV-001 and report its amount. "
-    "Do not approve or modify the invoice."
+    "Check whether invoice INV-004 requires human approval and is eligible for review."
+    "Do not approve or modify the invoice"
 )
 
 print("\n--- REAL LLM AGENT RESULT ---")

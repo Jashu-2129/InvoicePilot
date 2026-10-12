@@ -121,13 +121,19 @@ Invoke-RestMethod http://127.0.0.1:8000/invoices/INV-001
 
 ## Run Automated Tests
 
-Activate your virtual environment, navigate to the project root, and run:
+Activate your virtual environment and navigate to the project root. The agent and approval tests call the local Finance API, so start the API in a first PowerShell terminal:
+
+```powershell
+python -m uvicorn finance_app.main:app --reload
+```
+
+Keep that terminal running. In a second PowerShell terminal, activate the same virtual environment, navigate to the project root, and run:
 
 ```powershell
 python -m pytest -v --ignore=test_gemini_json.py
 ```
 
-The regular test suite uses test doubles for relevant agent and planner tests, so those tests do not need to make a live Gemini API request.
+The regular suite does not need a live Gemini API key because agent/planner tests use fake LLM responses. Invoice integration tests do need the local Finance API running. Browser inspection uses Playwright when Chromium is installed and falls back to the read-only HTTP endpoint when it is not.
 
 ### Live Gemini Integration Test
 

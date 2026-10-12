@@ -1,3 +1,4 @@
+
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -13,8 +14,12 @@ class AgentState:
     observations: list[str] = field(default_factory=list)
     actions_taken: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    data: dict[str, Any] = field(default_factory=dict)
 
     success: bool = False
     finished: bool = False
 
-    data: dict[str, Any] = field(default_factory=dict)
+    @property
+    def goal(self) -> str:
+        """Compatibility alias for code that reads state.goal."""
+        return self.user_goal
