@@ -55,6 +55,13 @@ def seed_sample_invoices():
             "pending",
             "Electrical equipment"
         ),
+        (
+            "INV-004",
+            "Test Vendor",
+            75000.00,
+            "pending",
+            "Approval threshold test"
+        ),
     ]
 
     with get_connection() as connection:

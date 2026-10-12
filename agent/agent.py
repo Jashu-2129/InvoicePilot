@@ -1,7 +1,7 @@
+
 import json
 import logging
 import re
-import time
 
 from agent.state import AgentState
 from agent.executor import Executor
@@ -9,344 +9,568 @@ from agent.recovery import Recovery
 from agent.verifier import Verifier
 from agent.planner import Planner
 from tools.approval_tools import ApprovalTools
+from llm.client import LLMClient
+
 
 logger = logging.getLogger(__name__)
 
 
 class InvoiceAgent:
-    def __init__(
-        self,
-        llm,
-        executor=None,
-        recovery=None,
-        verifier=None,
-    ):
-        self.llm = llm
-        self.planner = Planner(llm)
-        self.executor = executor or Executor()
-        self.recovery = recovery or Recovery()
-        self.verifier = verifier or Verifier()
+    def __init__(self, llm=None):
+        self.llm = llm or LLMClient()
+        self.planner = Planner(self.llm)
+        self.executor = Executor()
+        self.recovery = Recovery()
+        self.verifier = Verifier()
         self.approval_tools = ApprovalTools()
 
+    # ---------------------------------------------------------
+    # State helpers
+    # ---------------------------------------------------------
+
     @staticmethod
-    def _extract_invoice_id(user_goal):
+    def _initialize_state(state):
+        state.data.setdefault("retry_count", 0)
+        state.data.setdefault("unresolved_errors", [])
+        state.data.setdefault("verification_passed", False)
+
+    @staticmethod
+    def _normalize(text):
+        return re.sub(r"\s+", " ", str(text)).strip().lower()
+
+    @staticmethod
+    def _extract_invoice_id(text):
         match = re.search(
             r"\bINV-\d+\b",
-            user_goal,
+            str(text),
             flags=re.IGNORECASE,
         )
         return match.group(0).upper() if match else None
 
     @staticmethod
-    def _find_invoice(value):
-        if isinstance(value, str):
-            try:
-                value = json.loads(value)
-            except (json.JSONDecodeError, TypeError):
-                return None
+    def _record_error(state, message):
+        state.errors.append(str(message))
+        state.observations.append(f"Error: {message}")
 
-        if isinstance(value, dict):
-            invoice_id = value.get("invoice_id") or value.get("id")
-
-            if invoice_id and any(
-                key in value
-                for key in ("amount", "total_amount", "total")
-            ):
-                return value
-
-            page_content = value.get("page_content")
-            if isinstance(page_content, str):
-                found = InvoiceAgent._find_invoice(page_content)
-                if found is not None:
-                    return found
-
-            for key in ("invoice", "data", "result"):
-                if key in value:
-                    found = InvoiceAgent._find_invoice(value[key])
-                    if found is not None:
-                        return found
-
-        elif isinstance(value, list):
-            for item in value:
-                found = InvoiceAgent._find_invoice(item)
-                if found is not None:
-                    return found
-
-        return None
-
-    @staticmethod
-    def _get_amount(invoice):
-        if not isinstance(invoice, dict):
-            return None
-
-        for key in ("amount", "total_amount", "total"):
-            if key in invoice:
-                try:
-                    amount = float(invoice[key])
-                    return amount if amount >= 0 else None
-                except (TypeError, ValueError):
-                    return None
-
-        return None
+    # ---------------------------------------------------------
+    # Planning
+    # ---------------------------------------------------------
 
     def plan(self, state):
         try:
+            # Planner.create_plan expects AgentState.
             plan = self.planner.create_plan(state)
+
+            if not isinstance(plan, list):
+                raise ValueError("Planner must return a list of steps.")
+
             state.plan = plan
-            logger.info("Agent plan: %s", plan)
             return plan
+
         except Exception as exc:
-            error = f"Planning failed: {exc}"
-            logger.exception(error)
-            state.errors.append(error)
-            state.data.setdefault("unresolved_errors", []).append(error)
-            state.plan = []
+            self._record_error(state, f"Planning failed: {exc}")
+            state.data["verification_passed"] = False
+            state.success = False
+            state.finished = False
             return []
 
-    def execute_with_retry(self, state, tool_name, **arguments):
-        retry_limit = max(1, self.recovery.max_retries)
-        state.data.setdefault("retry_count", 0)
+    # ---------------------------------------------------------
+    # Step classification
+    # ---------------------------------------------------------
 
-        for attempt in range(retry_limit):
+    @classmethod
+    def _classify_step(cls, step):
+        normalized = cls._normalize(step)
+        compact = re.sub(r"[^a-z0-9]", "", normalized)
+
+        # Never execute approval, payment, modification or deletion.
+        unsafe_patterns = (
+            r"\bapprove\b",
+            r"\bpay\b",
+            r"\bmodify\b",
+            r"\bupdate\b",
+            r"\bdelete\b",
+        )
+
+        if any(re.search(pattern, normalized) for pattern in unsafe_patterns):
+            # A read-only eligibility check is allowed.
+            if (
+                "approval" in normalized
+                and any(
+                    word in normalized
+                    for word in ("check", "eligibility", "eligible", "require")
+                )
+                and not any(
+                    word in normalized
+                    for word in ("approve", "pay", "modify", "update", "delete")
+                )
+            ):
+                return "check_approval"
+
+            return "unsafe"
+
+        if (
+            "approval" in normalized
+            and any(
+                word in normalized
+                for word in ("check", "eligibility", "eligible", "require")
+            )
+        ):
+            return "check_approval"
+
+        if any(
+            phrase in compact
+            for phrase in (
+                "findinvoice",
+                "inspectinvoice",
+                "openinvoice",
+                "retrieveinvoice",
+            )
+        ):
+            return "inspect_invoice"
+
+        if any(
+            phrase in compact
+            for phrase in (
+                "readinvoiceamount",
+                "getinvoiceamount",
+                "extractinvoiceamount",
+                "retrieveinvoiceamount",
+            )
+        ):
+            return "read_amount"
+
+        if any(
+            phrase in compact
+            for phrase in (
+                "reportinvoiceamount",
+                "returninvoiceamount",
+                "displayinvoiceamount",
+                "provideinvoiceamount",
+            )
+        ):
+            return "report_amount"
+
+        return "unsupported"
+
+    # ---------------------------------------------------------
+    # Tool execution with retry
+    # ---------------------------------------------------------
+
+    def execute_with_retry(
+        self,
+        state,
+        tool_name,
+        max_retries=2,
+        **arguments,
+    ):
+        """Execute a read-only tool, retrying temporary failures.
+
+        ``max_retries`` counts retries after the initial attempt. Errors from
+        failed attempts are retained for audit, but are marked recovered if a
+        later attempt succeeds.
+        """
+        if tool_name != "inspect_invoice":
+            raise ValueError(f"Unsupported tool: {tool_name}")
+
+        state.data.setdefault("retry_count", 0)
+        state.data.setdefault("unresolved_errors", [])
+        last_error = None
+        retry_errors = []
+
+        for attempt in range(max_retries + 1):
             try:
                 result = self.executor.execute_tool(
                     state,
                     tool_name,
                     **arguments,
                 )
+                state.data["last_result"] = result
+                state.data["last_tool_error"] = None
 
-                if isinstance(result, dict) and result.get("error"):
-                    raise RuntimeError(str(result["error"]))
-
-                # A successful retry resolves errors from earlier attempts.
-                state.data["unresolved_errors"] = []
+                for error in retry_errors:
+                    self.recovery.mark_recovered(state, error)
+                if retry_errors:
+                    state.observations.append(
+                        f"Tool {tool_name} succeeded after "
+                        f"{len(retry_errors)} retry attempt(s)."
+                    )
                 return result
 
             except Exception as exc:
-                error = f"Tool {tool_name} failed: {exc}"
-                state.errors.append(error)
-                state.data.setdefault("unresolved_errors", []).append(error)
+                last_error = exc
+                message = str(exc)
 
-                # Count failed attempts, including the final failed attempt.
-                state.data["retry_count"] += 1
+                if attempt < max_retries:
+                    retry_errors.append(message)
+                    state.errors.append(message)
+                    state.data["retry_count"] += 1
+                    state.data.setdefault("unresolved_errors", []).append(
+                        message
+                    )
+                    logger.warning(
+                        "Retrying %s: attempt %s/%s; error: %s",
+                        tool_name,
+                        attempt + 1,
+                        max_retries,
+                        message,
+                    )
 
-                logger.warning(
-                    "%s, attempt %s/%s",
-                    error,
-                    attempt + 1,
-                    retry_limit,
-                )
+        message = str(last_error or "Tool execution failed.")
+        state.data["last_tool_error"] = message
+        self._record_error(state, message)
+        state.data.setdefault("unresolved_errors", []).append(message)
+        return None
 
-                if attempt + 1 < retry_limit:
-                    time.sleep(min(2 ** attempt, 5))
+    # Invoice content parsing
+    # ---------------------------------------------------------
+
+    @staticmethod
+    def _parse_invoice_content(content):
+        if isinstance(content, dict):
+            return content
+
+        if not isinstance(content, str):
+            return {}
+
+        content = content.strip()
+        if not content:
+            return {}
+
+        try:
+            parsed = json.loads(content)
+            return parsed if isinstance(parsed, dict) else {}
+        except (json.JSONDecodeError, TypeError):
+            return {}
+
+    @staticmethod
+    def _to_number(value):
+        if isinstance(value, bool) or value is None:
+            return None
+
+        if isinstance(value, (int, float)):
+            return float(value)
+
+        if isinstance(value, str):
+            cleaned = (
+                value.strip()
+                .replace(",", "")
+                .replace("₹", "")
+                .replace("INR", "")
+                .strip()
+            )
+            try:
+                return float(cleaned)
+            except ValueError:
+                return None
 
         return None
 
-    def _inspect_invoice(self, state, invoice_id):
-        result = self.execute_with_retry(
-            state,
-            "inspect_invoice",
-            invoice_id=invoice_id,
+    @staticmethod
+    def _amount_from_text(text):
+        if not isinstance(text, str):
+            return None
+
+        patterns = (
+            r"\b(?:invoice\s+)?amount\b\s*[:=]\s*"
+            r"(?:₹\s*|INR\s*)?([\d,]+(?:\.\d{1,2})?)",
+            r"\btotal(?:\s+amount)?\b\s*[:=]\s*"
+            r"(?:₹\s*|INR\s*)?([\d,]+(?:\.\d{1,2})?)",
         )
-        invoice = self._find_invoice(result)
 
-        if not isinstance(invoice, dict):
-            return None
+        for pattern in patterns:
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if match:
+                return float(match.group(1).replace(",", ""))
 
-        found_id = str(
-            invoice.get("invoice_id", invoice.get("id", ""))
-        ).upper()
+        return None
 
-        if found_id != invoice_id:
-            return None
+    def _get_invoice(self, state):
+        # Reuse previously parsed invoice data.
+        invoice = state.data.get("invoice")
+        if isinstance(invoice, dict) and invoice:
+            return invoice
+
+        result = state.data.get("last_result", {})
+
+        if not isinstance(result, dict):
+            return {}
+
+        # Support tools or tests returning the invoice directly.
+        direct_invoice = result.get("invoice")
+        if isinstance(direct_invoice, dict):
+            invoice = direct_invoice
+        else:
+            invoice = self._parse_invoice_content(
+                result.get("page_content", "")
+            )
+
+        if invoice:
+            state.data["invoice"] = invoice
 
         return invoice
 
-    def run(self, user_goal):
-        state = AgentState(user_goal=user_goal)
+    def _extract_amount(self, state):
+        invoice = self._get_invoice(state)
 
-        target_id = self._extract_invoice_id(user_goal)
-        if not target_id:
+        # First check the structured invoice.
+        amount = self._to_number(invoice.get("amount"))
+        if amount is not None:
+            return amount
+
+        # Then check a directly returned amount.
+        result = state.data.get("last_result", {})
+        if isinstance(result, dict):
+            amount = self._to_number(result.get("amount"))
+            if amount is not None:
+                return amount
+
+            # Finally try labelled amount text from the webpage.
+            amount = self._amount_from_text(
+                str(result.get("page_content", ""))
+            )
+            if amount is not None:
+                return amount
+
+        return None
+
+    def _get_amount(self, state):
+        amount = self._to_number(state.data.get("invoice_amount"))
+
+        if amount is None:
+            amount = self._extract_amount(state)
+
+        if amount is not None:
+            state.data["invoice_amount"] = amount
+
+        return amount
+
+    # ---------------------------------------------------------
+    # Verification
+    # ---------------------------------------------------------
+
+    def _verify(self, state):
+        try:
+            # Verifier.verify accepts state only.
+            result = self.verifier.verify(state)
+            return result is True
+        except Exception as exc:
+            self._record_error(state, f"Verification failed: {exc}")
+            state.data["verification_passed"] = False
+            state.success = False
+            return False
+
+    # ---------------------------------------------------------
+    # Approval eligibility check (read-only)
+    # ---------------------------------------------------------
+
+    def _check_approval_eligibility(self, state, invoice_id):
+        try:
+            result = self.approval_tools.check_approval_eligibility(
+                invoice_id=invoice_id
+            )
+
+            if not isinstance(result, dict):
+                raise ValueError("Invalid approval eligibility result.")
+
+            returned_id = result.get("invoice_id")
+            if (
+                isinstance(returned_id, str)
+                and returned_id.upper() != invoice_id.upper()
+            ):
+                raise ValueError(
+                    "Approval result belongs to a different invoice."
+                )
+
+            amount = self._to_number(result.get("amount"))
+            if amount is None or amount < 0:
+                raise ValueError("Invoice amount is missing or invalid.")
+
+            if "human_approval_required" not in result:
+                raise ValueError(
+                    "Approval result is missing human_approval_required."
+                )
+
+            if "eligible_for_approval_review" not in result:
+                raise ValueError(
+                    "Approval result is missing eligible_for_approval_review."
+                )
+
+            state.data["approval_eligibility"] = result
+            state.data["invoice_amount"] = amount
+            state.data["verification_passed"] = True
+            state.data["unresolved_errors"] = []
+
+            if result["human_approval_required"]:
+                state.observations.append(
+                    f"Human approval is required for invoice {invoice_id}."
+                )
+            else:
+                state.observations.append(
+                    f"Human approval is not required for invoice {invoice_id}."
+                )
+
+            self._verify(state)
+            state.finished = state.success
+            return state.success
+
+        except Exception as exc:
+            self._record_error(state, str(exc))
+            state.data["verification_passed"] = False
+            state.success = False
+            state.finished = True
+            return False
+
+    # ---------------------------------------------------------
+    # Main agent workflow
+    # ---------------------------------------------------------
+
+    def run(self, goal):
+        state = AgentState(user_goal=goal)
+        self._initialize_state(state)
+
+        plan = self.plan(state)
+
+        if not plan:
+            state.success = False
+            state.finished = False
+            return state
+
+        step_types = [self._classify_step(step) for step in plan]
+
+        # Reject unsafe/unsupported steps before making tool calls.
+        if any(kind in ("unsafe", "unsupported") for kind in step_types):
             state.observations.append(
-                "Unsupported operation: no invoice ID was found."
+                "Workflow rejected: plan contains an unsafe or unsupported step."
             )
             state.data["verification_passed"] = False
             state.success = False
             state.finished = False
             return state
 
-        goal_lower = user_goal.lower()
-        approval_query = (
-            "approval" in goal_lower
-            and any(
-                word in goal_lower
-                for word in (
-                    "check",
-                    "whether",
-                    "eligibility",
-                    "eligible",
-                    "requires",
-                    "require",
-                )
-            )
-        )
+        invoice_id = self._extract_invoice_id(goal)
 
-        state.plan = self.plan(state)
+        if not invoice_id:
+            for step in plan:
+                invoice_id = self._extract_invoice_id(step)
+                if invoice_id:
+                    break
 
-        if not state.plan:
+        if not invoice_id:
+            self._record_error(state, "No valid invoice ID was provided.")
+            state.data["verification_passed"] = False
+            state.success = False
+            state.finished = False
+            return state
+
+        # Read-only approval eligibility workflow.
+        if "check_approval" in step_types:
+            self._check_approval_eligibility(state, invoice_id)
+            return state
+
+        if "inspect_invoice" not in step_types:
             state.observations.append(
-                "Unable to create a valid execution plan."
+                "Workflow is incomplete: invoice inspection is missing."
             )
             state.data["verification_passed"] = False
+            state.success = False
+            state.finished = False
+            return state
+
+        # Inspect the invoice.
+        result = self.execute_with_retry(
+            state,
+            "inspect_invoice",
+            invoice_id=invoice_id,
+        )
+
+        if result is None:
+            error_message = state.data.get("last_tool_error", "")
+
+            if (
+                "not found" in error_message.lower()
+                or "404" in error_message
+            ):
+                state.data["verification_passed"] = False
+                state.success = False
+                state.finished = True
+            else:
+                state.data["verification_passed"] = False
+                state.success = False
+                state.finished = False
+
+            return state
+
+        if not isinstance(result, dict):
+            self._record_error(state, "Invoice inspection returned invalid data.")
+            state.data["verification_passed"] = False
+            state.success = False
+            state.finished = False
+            return state
+
+        state.data["last_result"] = result
+
+        if result.get("http_status") == 404:
+            self._record_error(
+                state,
+                f"Invoice {invoice_id} was not found.",
+            )
+            state.data["verification_passed"] = False
+            state.success = False
             state.finished = True
             return state
 
-        invoice = None
-        amount = None
-        invoice_retrieved = False
-        amount_read = False
-        reported = False
-        approval_checked = False
+        invoice = self._get_invoice(state)
 
-        for step in state.plan:
-            step_lower = re.sub(r"\s+", " ", step.lower()).strip()
-            compact_step = re.sub(r"\s+", "", step_lower)
+        # Even if page content is not JSON, retain the result for
+        # labelled-text amount extraction.
+        if not invoice and "page_content" in result:
+            state.data["invoice"] = {
+                "invoice_id": invoice_id,
+                "page_content": result["page_content"],
+            }
 
-            if approval_query and (
-                "approval" in step_lower or "eligible" in step_lower
-            ):
-                try:
-                    eligibility = (
-                        self.approval_tools.check_approval_eligibility(
-                            target_id
-                        )
-                    )
-                    state.data["approval_eligibility"] = eligibility
-                    state.data["invoice_id"] = target_id
-                    state.observations.append(
-                        f"Approval eligibility checked for {target_id}. "
-                        "Human approval is required when the invoice "
-                        "amount meets the configured threshold."
-                    )
-                    approval_checked = True
-
-                except Exception as exc:
-                    error = f"Could not check approval eligibility: {exc}"
-                    state.errors.append(error)
-                    state.data.setdefault(
-                        "unresolved_errors", []
-                    ).append(error)
-                    state.observations.append(error)
-
-                continue
-
-            if any(
-                phrase in step_lower
-                for phrase in (
-                    "find invoice",
-                    "retrieve invoice",
-                    "inspect invoice",
-                    "fetch invoice",
-                )
-            ):
-                invoice = self._inspect_invoice(state, target_id)
-
-                if invoice is not None:
-                    invoice_retrieved = True
-                    state.data["invoice"] = invoice
-                    state.data["invoice_id"] = target_id
-                    state.observations.append(
-                        f"Retrieved invoice {target_id}."
-                    )
-                else:
-                    invoice_retrieved = False
-                    state.observations.append(
-                        f"Invoice {target_id} was not found or "
-                        "its details were invalid."
-                    )
-
-            elif compact_step in (
-                "readinvoiceamount",
-                "extractinvoiceamount",
-            ):
-                if not invoice_retrieved:
-                    state.observations.append(
-                        "Cannot read the amount before retrieving "
-                        "the invoice."
-                    )
-                    continue
-
-                amount = self._get_amount(invoice)
-
-                if amount is not None:
-                    amount_read = True
-                    state.data["invoice_amount"] = amount
-                    state.data["amount"] = amount
-                    state.observations.append(
-                        f"Invoice amount: ₹{amount:,.2f}."
-                    )
-                else:
-                    state.observations.append(
-                        "The invoice amount is missing or invalid."
-                    )
-
-            elif compact_step == "reportinvoiceamount":
-                if amount_read:
-                    reported = True
-                    state.observations.append(
-                        f"Invoice {target_id} amount is ₹{amount:,.2f}."
-                    )
-                else:
-                    state.observations.append(
-                        "Cannot report the amount because it has "
-                        "not been read successfully."
-                    )
-
-            else:
-                state.observations.append(
-                    f"Skipped unsupported plan step: {step}"
-                )
-
-        workflow_checks_passed = (
-            invoice_retrieved
-            and amount_read
-            and reported
-            and invoice is not None
-            and str(
-                invoice.get("invoice_id", invoice.get("id", ""))
-            ).upper() == target_id
-            and amount is not None
+        state.observations.append(
+            f"Invoice {invoice_id} was inspected successfully."
         )
 
-        if approval_query:
-            workflow_checks_passed = approval_checked
-
-        state.data["invoice_id"] = target_id
-        state.data["verification_passed"] = bool(
-            workflow_checks_passed
-        )
-
-        try:
-            verification_passed = self.verifier.verify(state)
-        except Exception as exc:
-            logger.exception("Verification failed")
-            state.errors.append(f"Verification failed: {exc}")
-            state.data["verification_passed"] = False
-            verification_passed = False
-
-        state.data["verification_passed"] = verification_passed
-        state.success = verification_passed
-
-        # Unsupported or incomplete plans remain unfinished so the
-        # caller can distinguish incomplete work from completed failure.
-        if verification_passed:
-            state.finished = True
-        elif any(
-            observation.startswith("Skipped unsupported plan step:")
-            for observation in state.observations
+        # A find-only plan is not a completed amount-reporting workflow.
+        if (
+            "read_amount" not in step_types
+            or "report_amount" not in step_types
         ):
+            state.observations.append(
+                "Workflow is incomplete: invoice amount was not read and reported."
+            )
+            state.data["verification_passed"] = False
+            state.success = False
             state.finished = False
-        else:
+            return state
+
+        amount = self._get_amount(state)
+
+        if amount is None:
+            self._record_error(
+                state,
+                f"Could not extract the amount for invoice {invoice_id}.",
+            )
+            state.data["verification_passed"] = False
+            state.success = False
+            state.finished = False
+            return state
+
+        state.data["invoice_amount"] = amount
+
+        # Keep the exact report text consistent with the verifier.
+        report = f"Report: The invoice amount is ₹{amount:,.2f}."
+        state.observations.append(report)
+
+        state.data["unresolved_errors"] = []
+        state.data["verification_passed"] = True
+
+        self._verify(state)
+
+        if state.success:
             state.finished = True
 
         return state

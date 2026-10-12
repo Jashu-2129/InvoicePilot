@@ -15,3 +15,5 @@ htmlcov/
 .env.*
 !.env.example
 .vscode/
+*.log
+.DS_Store
