@@ -35,6 +35,7 @@ InvoicePilot/
 ├── logs/                  # Log directory
 ├── tests/                 # Automated tests
 ├── tools/                 # Invoice, browser, and approval tools
+├── utils/                 # Shared utilities and logging
 ├── .env.example           # Environment variable template
 ├── .gitignore
 ├── requirements.txt
