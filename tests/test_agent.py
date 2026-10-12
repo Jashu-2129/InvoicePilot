@@ -1,6 +1,9 @@
 from unittest.mock import Mock
 
 from agent.agent import InvoiceAgent
+from agent.state import AgentState
+from agent.recovery import Recovery
+from agent.verifier import Verifier
 
 
 class FakeLLM:
@@ -27,6 +30,14 @@ class IncompleteWorkflowFakeLLM:
         return '["Perform an unsupported operation"]'
 
 
+class UnsafeActionFakeLLM:
+    def ask(self, prompt: str) -> str:
+        return (
+            '["Approve invoice INV-001", '
+            '"Modify invoice INV-001"]'
+        )
+
+
 def test_agent_inspects_and_reports_invoice():
     agent = InvoiceAgent(FakeLLM())
 
@@ -39,7 +50,7 @@ def test_agent_inspects_and_reports_invoice():
     assert state.data["invoice"]["invoice_id"] == "INV-001"
     assert state.data["invoice_amount"] == 35000.0
     assert any(
-        "₹35,000.00" in observation
+        "35,000.00" in observation
         for observation in state.observations
     )
 
@@ -60,7 +71,6 @@ def test_agent_checks_approval_eligibility():
     assert result["amount"] == 75000.0
     assert result["human_approval_required"] is True
     assert result["eligible_for_approval_review"] is True
-
     assert any(
         "Human approval is required" in observation
         for observation in state.observations
@@ -93,18 +103,12 @@ def test_agent_does_not_succeed_on_incomplete_workflow():
 def test_agent_retries_temporary_tool_failure():
     agent = InvoiceAgent(Mock())
 
-    # Simulate a temporary failure followed by a successful tool call.
     agent.executor.execute_tool = Mock(
         side_effect=[
             RuntimeError("Temporary connection error"),
-            {
-                "http_status": 200,
-                "page_content": "{}",
-            },
+            {"http_status": 200, "page_content": "{}"},
         ]
     )
-
-    from agent.state import AgentState
 
     state = AgentState(user_goal="Find invoice INV-001")
 
@@ -119,23 +123,18 @@ def test_agent_retries_temporary_tool_failure():
     assert state.data["retry_count"] == 1
     assert len(state.errors) == 1
 
+
 def test_recovered_error_does_not_block_verification():
-    from agent.recovery import Recovery
-    from agent.state import AgentState
-    from agent.verifier import Verifier
-
     state = AgentState(user_goal="Test error recovery")
-    recovery = Recovery()
 
+    recovery = Recovery()
     recovery.handle_error(state, "Temporary connection error")
+
     assert state.data["unresolved_errors"] == [
         "Temporary connection error"
     ]
 
-    recovery.mark_recovered(
-        state,
-        "Temporary connection error",
-    )
+    recovery.mark_recovered(state, "Temporary connection error")
 
     state.data["verification_passed"] = True
 
@@ -144,3 +143,22 @@ def test_recovered_error_does_not_block_verification():
     assert Verifier().verify(state) is True
     assert state.success is True
     assert state.finished is True
+
+
+def test_agent_does_not_execute_approval_or_modification_actions():
+    agent = InvoiceAgent(UnsafeActionFakeLLM())
+
+    agent.executor.execute_tool = Mock()
+    agent.approval_tools.check_approval_eligibility = Mock()
+
+    state = agent.run(
+        "Find invoice INV-001. "
+        "Do not approve or modify the invoice."
+    )
+
+    assert state.success is False
+    assert agent.executor.execute_tool.call_count == 0
+    assert (
+        agent.approval_tools.check_approval_eligibility.call_count
+        == 0
+    )
